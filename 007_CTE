@@ -1,0 +1,199 @@
+# Common Table Expressions (CTE) — Deep Dive Notes
+
+## 1. Definition
+
+A **CTE (Common Table Expression)** is a named, temporary result set defined using a `WITH` clause, which exists only for the duration of a single SQL statement. It is not stored as an object in the database — it's a logical construct that makes complex queries more readable and enables recursion.
+
+- Scope: only the statement immediately following it.
+- Not persisted — dropped once the query finishes executing.
+- Can be referenced multiple times within the same query.
+- Two types: **Non-recursive CTE** and **Recursive CTE**.
+
+---
+
+## 2. Syntax
+
+### 2.1 Basic (non-recursive) CTE
+
+```sql
+WITH cte_name (col1, col2, ...) AS (
+    SELECT col1, col2, ...
+    FROM some_table
+    WHERE condition
+)
+SELECT *
+FROM cte_name;
+```
+
+- Column list `(col1, col2, ...)` is optional — if omitted, column names are inferred from the inner `SELECT`.
+
+### 2.2 Multiple CTEs (chained)
+
+```sql
+WITH cte1 AS (
+    SELECT ...
+),
+cte2 AS (
+    SELECT ... FROM cte1 ...
+)
+SELECT *
+FROM cte1
+JOIN cte2 ON ...;
+```
+
+- Only **one `WITH` keyword** — subsequent CTEs are comma-separated.
+- A later CTE can reference an earlier one (left-to-right visibility), but not vice versa.
+
+### 2.3 Recursive CTE
+
+```sql
+WITH RECURSIVE cte_name AS (
+    -- Anchor member (base case)
+    SELECT col1, col2
+    FROM some_table
+    WHERE condition
+
+    UNION ALL
+
+    -- Recursive member
+    SELECT t.col1, t.col2
+    FROM some_table t
+    JOIN cte_name c ON t.parent_id = c.col1
+)
+SELECT * FROM cte_name;
+```
+
+- `RECURSIVE` keyword needed in PostgreSQL/SQLite/MySQL 8+. SQL Server doesn't require the keyword, just `WITH cte_name AS (...)`.
+- Must have exactly one anchor member and one (or more) recursive member(s), combined via `UNION ALL` (or `UNION` to auto-eliminate duplicates, but this disables certain optimizations and can be costlier).
+
+---
+
+## 3. How the Query is Resolved (Execution Model)
+
+CTEs are **not physically materialized tables** in most engines by default (behavior varies) — think of them as a named subquery whose definition is inlined/expanded by the optimizer.
+
+### Step-by-step resolution:
+
+1. **Parsing**: The parser reads the `WITH` clause and registers the CTE name(s) in a temporary namespace scoped to the statement.
+2. **Binding**: When the main query (or a later CTE) references `cte_name`, the parser binds it to the CTE definition — similar to how a derived table (subquery in `FROM`) is bound.
+3. **Optimization**:
+   - **Non-recursive CTE**: Most optimizers (PostgreSQL ≥12, SQL Server, MySQL 8+) treat it like an **inline-able view/subquery**. The optimizer may:
+     - **Inline/expand** the CTE's definition directly into the outer query plan (predicate pushdown, column pruning applied) — this is the common modern behavior.
+     - Or **materialize** it (compute once, store in a temp work area) if referenced multiple times, if it contains volatile functions, or if hints force it (e.g., `MATERIALIZED` keyword in Postgres).
+   - **Recursive CTE**: Always executes iteratively (see below) — cannot be simply inlined.
+4. **Execution (recursive case)** — the engine runs a loop conceptually like:
+   ```
+   working_table = result of anchor member
+   result = working_table
+   WHILE working_table is not empty:
+       working_table = result of recursive member (using working_table as the reference to cte_name)
+       append working_table to result
+   return result
+   ```
+   - Each iteration, `cte_name` inside the recursive member refers only to the rows produced in the *previous* iteration, not the entire accumulated result (important distinction).
+   - Recursion terminates when the working table produces zero new rows.
+5. **Final result** is passed to the outer query for further filtering/joining/aggregation as written.
+
+### PostgreSQL specific note (v12+):
+- Default: CTEs are inlined like subqueries (can be pushed down, filtered early).
+- Force materialization: `WITH cte_name AS MATERIALIZED (...)`.
+- Force inlining: `WITH cte_name AS NOT MATERIALIZED (...)`.
+
+### SQL Server / Oracle:
+- CTE is expanded into the query plan at compile time — behaves like a view textually substituted in; the optimizer decides join order, etc., as if you'd written the subquery inline.
+
+---
+
+## 4. Why "Multiple `SELECT`" (i.e., multiple independent result sets) Don't Work in One CTE Statement
+
+This is a common confusion point. Key facts:
+
+- A **single CTE block** can contain only **one `SELECT` statement** as its defining query (except recursive CTEs, which combine exactly two parts via `UNION ALL`: anchor + recursive member).
+- You **cannot** do:
+  ```sql
+  WITH cte1 AS (
+      SELECT * FROM a;
+      SELECT * FROM b;   -- ❌ invalid — two SELECTs, no UNION combining them
+  )
+  ```
+  Because a CTE definition must evaluate to **one single tabular result** — SQL requires a single, unambiguous logical result set to bind the name `cte1` to. Two unrelated `SELECT`s have no defined way to merge into one named object.
+- To combine multiple result sets under one CTE, you must explicitly use a set operator (`UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`) so the two SELECTs become **one logical result**:
+  ```sql
+  WITH cte1 AS (
+      SELECT * FROM a
+      UNION ALL
+      SELECT * FROM b
+  )
+  SELECT * FROM cte1;
+  ```
+- If you want **multiple independent named result sets**, you must declare **multiple separate CTEs** (comma-separated, one `SELECT` each), not multiple `SELECT`s inside one:
+  ```sql
+  WITH cte1 AS (SELECT * FROM a),
+       cte2 AS (SELECT * FROM b)
+  SELECT * FROM cte1 JOIN cte2 ON ...;
+  ```
+- Also — the **outer/final statement** after all CTEs can only be **one statement** (`SELECT`, or in some engines `INSERT`/`UPDATE`/`DELETE`/`MERGE` using the CTE) — you can't chain multiple final statements off one `WITH`.
+
+**Underlying reason**: A CTE is a *name bound to a single relation (table expression)* — SQL's relational model requires every named expression to resolve to exactly one schema (fixed set of columns/types). Multiple unrelated SELECTs would produce ambiguous/undefined shape for that name, so the grammar disallows it outright (parse-time error, not a runtime one).
+
+---
+
+## 5. How CTEs Are "Stored" — Storage & Lifetime Details
+
+| Aspect | Behavior |
+|---|---|
+| **Persistence** | Never persisted to disk as a schema object (unlike views). Exists only in the context of the single statement it's attached to. |
+| **Metadata** | No entry created in system catalogs (e.g., no row in `information_schema.views` or `pg_class`). Compare to a `VIEW`, which *is* stored as metadata (query definition) permanently. |
+| **Memory representation** | Depending on optimizer decision: either (a) **inlined** — no separate storage, becomes part of the outer plan's operator tree, or (b) **materialized** — computed once and held in a temporary work area (in-memory, or spilled to disk `tempdb`/`temp` tablespace if large), then read from there for every reference. |
+| **Recursive CTE storage** | Requires an internal **working table** (conceptually a queue/temp structure) to hold "current iteration" rows, plus an accumulating result set. This is engine-internal temp storage, not user-visible. |
+| **Multiple references** | If the same CTE is referenced 2+ times in the outer query and the engine decides to materialize it, it's computed once and reused — avoiding recomputation. If inlined instead, it may be logically recomputed per reference (though the optimizer can still dedupe access to the underlying tables). |
+| **Indexes** | CTEs cannot have indexes created on them (since they aren't real stored tables). |
+| **Statistics** | The optimizer does not maintain persistent statistics for a CTE the way it does for a real table — it estimates cardinality using the underlying base tables' stats, which can lead to poor recursive CTE plans on deep hierarchies. |
+
+**Contrast with related constructs:**
+- **View**: Query definition stored permanently in catalog; re-executed (or inlined) every time it's referenced in any query.
+- **Temp table**: Physically materialized in `tempdb`/temp storage, persists across statements within a session, can have indexes/stats.
+- **Materialized view**: Physically stores the *result* of the query on disk, refreshed manually/periodically.
+- **CTE**: Neither — purely a scoped alias for a query, lifetime = one statement.
+
+---
+
+## 6. Important Additional Details
+
+1. **Readability & maintainability** — CTEs let you break a complex nested-subquery query into logical, named, top-down steps (this is their main practical value, not performance).
+2. **No inherent performance benefit** — a CTE is not automatically faster than an equivalent subquery; in fact if materialized when it shouldn't be (or vice versa), it can be *slower*. Always check the execution plan.
+3. **Recursive CTE guardrails**:
+   - Infinite recursion is possible if the recursive member never converges (e.g., cyclic data without a termination check) — most engines have a `MAXRECURSION` (SQL Server, default 100) or similar safety limit; Postgres has no built-in limit — infinite loop must be guarded manually (e.g., add a depth counter column and `WHERE depth < N`).
+   - Recursive member **cannot** contain: `GROUP BY`, `HAVING`, aggregate functions, `DISTINCT`, `ORDER BY`, `TOP`/`LIMIT`, outer joins referencing the CTE, or subqueries referencing the CTE (rules vary slightly by engine, but these are broadly disallowed since each iteration must operate on the incremental working set only).
+4. **CTE vs Derived Table (subquery in FROM)**: Functionally similar (in non-recursive case), but CTE syntax allows self-reference (recursion) and improves readability by naming things upfront; derived tables cannot be recursive.
+5. **CTE and `INSERT`/`UPDATE`/`DELETE`**: Many engines (PostgreSQL, SQL Server) allow using a CTE ahead of a DML statement:
+   ```sql
+   WITH to_delete AS (
+       SELECT id FROM orders WHERE status = 'cancelled'
+   )
+   DELETE FROM orders WHERE id IN (SELECT id FROM to_delete);
+   ```
+6. **PostgreSQL data-modifying CTEs**: Postgres uniquely allows `INSERT`/`UPDATE`/`DELETE` *inside* a CTE itself (with a `RETURNING` clause), enabling multi-step data pipelines in a single statement:
+   ```sql
+   WITH moved_rows AS (
+       DELETE FROM employees WHERE dept = 'X' RETURNING *
+   )
+   INSERT INTO employees_archive SELECT * FROM moved_rows;
+   ```
+7. **Column aliasing**: You can rename output columns directly in the CTE header: `WITH cte(a, b) AS (SELECT x, y FROM t)`.
+8. **Naming collision**: A CTE name that matches an existing table name will **shadow** the real table for the duration of that statement.
+9. **Recursion direction**: Recursive CTEs are typically used for hierarchical/graph data — org charts, bill-of-materials, category trees, graph traversal (shortest path, connected components).
+10. **Optimizer fences (older Postgres <12)**: Before Postgres 12, CTEs were **always materialized** (optimization fence) — this was a well-known gotcha where CTEs could hurt performance vs. equivalent subqueries. Postgres 12+ changed default to inline unless forced otherwise. Good to know for interview context ("why might a CTE be slower than a subquery in an older Postgres version?").
+
+---
+
+## 7. Quick Recall Table
+
+| Feature | Non-Recursive CTE | Recursive CTE |
+|---|---|---|
+| Keyword | `WITH` | `WITH RECURSIVE` (Postgres/MySQL/SQLite) or `WITH` (SQL Server/Oracle) |
+| Structure | Single `SELECT` | Anchor `UNION ALL` Recursive |
+| Self-reference | Not allowed | Required in recursive member |
+| Typical use | Readability, breaking down logic, intermediate aggregation | Hierarchies, graphs, sequences |
+| Termination | N/A | Working set becomes empty |
+| Materialization | Optimizer's choice (inline/materialize) | Must iterate, working table maintained internally |
